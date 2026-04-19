@@ -34,6 +34,26 @@ var _ = Describe("Datagrams", func() {
 		Expect(err).To(MatchError(context.Canceled))
 	})
 
+	It("preserves order when the queue wraps", func() {
+		dg := newDatagrammer(nil)
+		for i := 0; i < streamDatagramQueueLen; i++ {
+			dg.enqueue([]byte{uint8(i)})
+		}
+		for i := 0; i < streamDatagramQueueLen/2; i++ {
+			data, err := dg.Receive(context.Background())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(data[0]).To(BeEquivalentTo(i))
+		}
+		for i := streamDatagramQueueLen; i < streamDatagramQueueLen+streamDatagramQueueLen/2; i++ {
+			dg.enqueue([]byte{uint8(i)})
+		}
+		for i := streamDatagramQueueLen / 2; i < streamDatagramQueueLen+streamDatagramQueueLen/2; i++ {
+			data, err := dg.Receive(context.Background())
+			Expect(err).ToNot(HaveOccurred())
+			Expect(data[0]).To(BeEquivalentTo(i))
+		}
+	})
+
 	It("blocks until a new datagram is received", func() {
 		dg := newDatagrammer(nil)
 		done := make(chan struct{})

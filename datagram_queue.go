@@ -20,7 +20,7 @@ type datagramQueue struct {
 	sent      chan struct{} // used to notify Add that a datagram was dequeued
 
 	rcvMx    sync.Mutex
-	rcvQueue [][]byte
+	rcvQueue ringbuffer.RingBuffer[[]byte]
 	rcvd     chan struct{} // used to notify Receive that a new datagram was received
 
 	closeErr error
@@ -32,13 +32,16 @@ type datagramQueue struct {
 }
 
 func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
-	return &datagramQueue{
+	q := &datagramQueue{
 		hasData: hasData,
 		rcvd:    make(chan struct{}, 1),
 		sent:    make(chan struct{}, 1),
 		closed:  make(chan struct{}),
 		logger:  logger,
 	}
+	q.sendQueue.Init(maxDatagramSendQueueLen)
+	q.rcvQueue.Init(maxDatagramRcvQueueLen)
+	return q
 }
 
 // Add queues a new DATAGRAM frame for sending.
@@ -95,8 +98,8 @@ func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
 	copy(data, f.Data)
 	var queued bool
 	h.rcvMx.Lock()
-	if len(h.rcvQueue) < maxDatagramRcvQueueLen {
-		h.rcvQueue = append(h.rcvQueue, data)
+	if h.rcvQueue.Len() < maxDatagramRcvQueueLen {
+		h.rcvQueue.PushBack(data)
 		queued = true
 		select {
 		case h.rcvd <- struct{}{}:
@@ -113,9 +116,8 @@ func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
 func (h *datagramQueue) Receive(ctx context.Context) ([]byte, error) {
 	for {
 		h.rcvMx.Lock()
-		if len(h.rcvQueue) > 0 {
-			data := h.rcvQueue[0]
-			h.rcvQueue = h.rcvQueue[1:]
+		if !h.rcvQueue.Empty() {
+			data := h.rcvQueue.PopFront()
 			h.rcvMx.Unlock()
 			return data, nil
 		}

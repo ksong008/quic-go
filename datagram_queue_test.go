@@ -80,6 +80,27 @@ func TestDatagramQueueReceive(t *testing.T) {
 	require.Equal(t, []byte("bar"), data)
 }
 
+func TestDatagramQueueReceiveWraparound(t *testing.T) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+
+	for i := 0; i < maxDatagramRcvQueueLen; i++ {
+		queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte{uint8(i)}})
+	}
+	for i := 0; i < maxDatagramRcvQueueLen/2; i++ {
+		data, err := queue.Receive(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, []byte{uint8(i)}, data)
+	}
+	for i := maxDatagramRcvQueueLen; i < maxDatagramRcvQueueLen+maxDatagramRcvQueueLen/2; i++ {
+		queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte{uint8(i)}})
+	}
+	for i := maxDatagramRcvQueueLen / 2; i < maxDatagramRcvQueueLen+maxDatagramRcvQueueLen/2; i++ {
+		data, err := queue.Receive(context.Background())
+		require.NoError(t, err)
+		require.Equal(t, []byte{uint8(i)}, data)
+	}
+}
+
 func TestDatagramQueueReceiveBlocking(t *testing.T) {
 	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
 

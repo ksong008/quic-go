@@ -40,6 +40,12 @@ func (e *errTransportClosed) Is(target error) bool {
 
 var errListenerAlreadySet = errors.New("listener already set")
 
+type queuedStatelessReset struct {
+	receivedPacket
+
+	packetInfoOOB []byte
+}
+
 // The Transport is the central point to manage incoming and outgoing QUIC connections.
 // QUIC demultiplexes connections based on their QUIC Connection IDs, not based on the 4-tuple.
 // This means that a single UDP socket can be used for listening for incoming connections, as well as
@@ -145,7 +151,7 @@ type Transport struct {
 	conn rawConn
 
 	closeQueue          chan closePacket
-	statelessResetQueue chan receivedPacket
+	statelessResetQueue chan queuedStatelessReset
 
 	listening   chan struct{} // is closed when listen returns
 	closeErr    error
@@ -391,7 +397,7 @@ func (t *Transport) init(allowZeroLengthConnIDs bool) error {
 		t.listening = make(chan struct{})
 
 		t.closeQueue = make(chan closePacket, 4)
-		t.statelessResetQueue = make(chan receivedPacket, 4)
+		t.statelessResetQueue = make(chan queuedStatelessReset, 4)
 		if t.TokenGeneratorKey == nil {
 			var key TokenGeneratorKey
 			if _, err := rand.Read(key[:]); err != nil {
@@ -443,7 +449,7 @@ func (t *Transport) runSendQueue() {
 		case <-t.listening:
 			return
 		case p := <-t.closeQueue:
-			t.conn.WritePacket(p.payload, p.addr, p.info.OOB(), 0, protocol.ECNUnsupported)
+			t.conn.WritePacket(p.payload, p.addr, p.packetInfoOOB, 0, protocol.ECNUnsupported)
 		case p := <-t.statelessResetQueue:
 			t.sendStatelessReset(p)
 		}
@@ -609,7 +615,7 @@ func (t *Transport) maybeSendStatelessReset(p receivedPacket) (statelessResetQue
 	}
 
 	select {
-	case t.statelessResetQueue <- p:
+	case t.statelessResetQueue <- queuedStatelessReset{receivedPacket: p, packetInfoOOB: p.info.OOB()}:
 		return true
 	default:
 		// it's fine to not send a stateless reset when we're busy
@@ -617,7 +623,7 @@ func (t *Transport) maybeSendStatelessReset(p receivedPacket) (statelessResetQue
 	}
 }
 
-func (t *Transport) sendStatelessReset(p receivedPacket) {
+func (t *Transport) sendStatelessReset(p queuedStatelessReset) {
 	defer p.buffer.Release()
 
 	connID, err := wire.ParseConnectionID(p.data, t.connIDLen)
@@ -631,7 +637,7 @@ func (t *Transport) sendStatelessReset(p receivedPacket) {
 	rand.Read(data)
 	data[0] = (data[0] & 0x7f) | 0x40
 	data = append(data, token[:]...)
-	if _, err := t.conn.WritePacket(data, p.remoteAddr, p.info.OOB(), 0, protocol.ECNUnsupported); err != nil {
+	if _, err := t.conn.WritePacket(data, p.remoteAddr, p.packetInfoOOB, 0, protocol.ECNUnsupported); err != nil {
 		t.logger.Debugf("Error sending Stateless Reset to %s: %s", p.remoteAddr, err)
 	}
 }

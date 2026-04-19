@@ -69,6 +69,8 @@ type oobConn struct {
 	batchConn batchConn
 
 	readPos uint8
+	// Timestamp captured when the current batch was read.
+	batchReadTime time.Time
 	// Packets received from the kernel, but not yet returned by ReadPacket().
 	messages []ipv4.Message
 	buffers  [batchSize]*packetBuffer
@@ -175,6 +177,7 @@ func (c *oobConn) ReadPacket() (receivedPacket, error) {
 		if n == 0 || err != nil {
 			return receivedPacket{}, err
 		}
+		c.batchReadTime = time.Now()
 		c.messages = c.messages[:n]
 	}
 
@@ -185,7 +188,7 @@ func (c *oobConn) ReadPacket() (receivedPacket, error) {
 	data := msg.OOB[:msg.NN]
 	p := receivedPacket{
 		remoteAddr: msg.Addr,
-		rcvTime:    time.Now(),
+		rcvTime:    c.batchReadTime,
 		data:       msg.Buffers[0][:msg.N],
 		buffer:     buffer,
 	}

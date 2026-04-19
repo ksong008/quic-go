@@ -2314,6 +2314,16 @@ func (s *connection) onMTUIncreased(mtu protocol.ByteCount) {
 }
 
 func (s *connection) SendDatagram(p []byte) error {
+	return s.sendDatagram(nil, p)
+}
+
+// SendDatagramWithHeader is an internal fast path used by the HTTP/3 layer to
+// prepend stream metadata without first allocating an intermediate combined slice.
+func (s *connection) SendDatagramWithHeader(header, payload []byte) error {
+	return s.sendDatagram(header, payload)
+}
+
+func (s *connection) sendDatagram(header, payload []byte) error {
 	if !s.supportsDatagrams() {
 		return errors.New("datagram support disabled")
 	}
@@ -2325,13 +2335,15 @@ func (s *connection) SendDatagram(p []byte) error {
 		f.MaxDataLen(s.peerParams.MaxDatagramFrameSize, s.version),
 		protocol.ByteCount(s.maxPayloadSizeEstimate.Load()),
 	)
-	if protocol.ByteCount(len(p)) > maxDataLen {
+	totalLen := len(header) + len(payload)
+	if protocol.ByteCount(totalLen) > maxDataLen {
 		return &DatagramTooLargeError{
 			MaxDataLen: int64(maxDataLen),
 		}
 	}
-	f.Data = make([]byte, len(p))
-	copy(f.Data, p)
+	f.Data = make([]byte, totalLen)
+	n := copy(f.Data, header)
+	copy(f.Data[n:], payload)
 	return s.datagramQueue.Add(f)
 }
 

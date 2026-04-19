@@ -3,6 +3,8 @@ package http3
 import (
 	"context"
 	"sync"
+
+	"github.com/daeuniverse/quic-go/internal/utils/ringbuffer"
 )
 
 const maxQuarterStreamID = 1<<60 - 1
@@ -13,7 +15,7 @@ type datagrammer struct {
 	sendDatagram func([]byte) error
 
 	hasData chan struct{}
-	queue   [][]byte // TODO: use a ring buffer
+	queue   ringbuffer.RingBuffer[[]byte]
 
 	mx         sync.Mutex
 	sendErr    error
@@ -21,10 +23,12 @@ type datagrammer struct {
 }
 
 func newDatagrammer(sendDatagram func([]byte) error) *datagrammer {
-	return &datagrammer{
+	d := &datagrammer{
 		sendDatagram: sendDatagram,
 		hasData:      make(chan struct{}, 1),
 	}
+	d.queue.Init(streamDatagramQueueLen)
+	return d
 }
 
 func (d *datagrammer) SetReceiveError(err error) {
@@ -67,19 +71,18 @@ func (d *datagrammer) enqueue(data []byte) {
 	if d.receiveErr != nil {
 		return
 	}
-	if len(d.queue) >= streamDatagramQueueLen {
+	if d.queue.Len() >= streamDatagramQueueLen {
 		return
 	}
-	d.queue = append(d.queue, data)
+	d.queue.PushBack(data)
 	d.signalHasData()
 }
 
 func (d *datagrammer) Receive(ctx context.Context) ([]byte, error) {
 start:
 	d.mx.Lock()
-	if len(d.queue) >= 1 {
-		data := d.queue[0]
-		d.queue = d.queue[1:]
+	if !d.queue.Empty() {
+		data := d.queue.PopFront()
 		d.mx.Unlock()
 		return data, nil
 	}

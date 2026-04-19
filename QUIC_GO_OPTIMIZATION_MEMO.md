@@ -259,3 +259,250 @@ Follow-up still worth doing:
 - benchmark the cached no-GSO ECN path versus the previous append-on-every-send path
 - evaluate whether one-off direct `rawConn.WritePacket(..., info.OOB(), ...)` callers are hot enough to justify their own packet-info OOB caching layer
 - after this write-path pass, move to `packet_handler_map.go` timer amortization
+
+### 2026-04-19 - Round 2: packet handler cleanup scheduling
+
+Status:
+
+- implemented
+- verification partially blocked by missing Go toolchain in this environment
+
+Files touched:
+
+- `packet_handler_map.go`
+- `packet_handler_map_test.go`
+
+What changed:
+
+- replaced per-call `time.AfterFunc` cleanup scheduling in `Retire` and `ReplaceWithClosed` with a shared cleanup queue
+- added one internal cleanup loop per `packetHandlerMap`, driven by a single reusable timer and a coalesced wakeup channel
+- kept the external behavior the same: retired IDs and closed-handler IDs are still removed only after `deleteRetiredConnsAfter`
+- copied `ReplaceWithClosed` connection ID slices before enqueueing cleanup, so delayed removal doesn't depend on caller-owned backing arrays
+- updated tests to close the map via `t.Cleanup`, preventing test-only background goroutine leaks now that the map owns a cleanup loop
+- added focused tests for:
+  - multiple retired connection IDs pending cleanup at once
+  - `ReplaceWithClosed` removing multiple connection IDs together
+
+Why this shape:
+
+- deliberately chose a simple shared timer loop over a heap / timer wheel to keep the change small and easy to reason about
+- this introduces one goroutine per `packetHandlerMap`, but removes the previous unbounded `AfterFunc` timer churn on connection-ID retirement paths
+- for the current "stability first" rule, that tradeoff is preferable to a more aggressive scheduling structure
+
+Expected effect:
+
+- fewer timer allocations and callback goroutines when many connection IDs are retired over time
+- more predictable cleanup behavior under high connection-ID churn
+- lower lifecycle overhead without changing retirement semantics
+
+Verification:
+
+- `git diff --check` passed on 2026-04-19 after this round
+- `go test` could not be run on 2026-04-19 because `go` was not installed in `PATH` in this environment
+
+Follow-up still worth doing:
+
+- when a Go toolchain is available, run focused tests for `packet_handler_map` and broader transport / connection tests
+- benchmark timer allocation and goroutine counts before and after this change under synthetic connection-ID churn
+- if profiling still points here, consider whether the shared cleanup queue needs ordering or batching refinements
+
+### 2026-04-19 - Round 3: queued packet-info OOB caching
+
+Status:
+
+- implemented
+- verification partially blocked by missing Go toolchain in this environment
+
+Files touched:
+
+- `packet_handler_map.go`
+- `server.go`
+- `transport.go`
+- `packet_info_oob_cache_test.go`
+
+What changed:
+
+- cached `packetInfoOOB` when enqueueing delayed close packets from `packet_handler_map`, instead of rebuilding it later in the transport send loop
+- introduced lightweight queued packet wrappers in `server.go` so Version Negotiation / Retry / INVALID_TOKEN / CONNECTION_REFUSED responses reuse the OOB bytes prepared when the packet was queued
+- introduced a lightweight queued stateless reset wrapper in `transport.go` so the stateless reset send path also reuses packet-info OOB prepared at queue time
+- kept `receivedPacket` unchanged, intentionally avoiding a larger per-packet struct expansion on the main receive hot path
+- added focused tests on OOB-capable platforms to verify that queued wrappers and delayed close packets preserve the cached OOB bytes
+
+Why this shape:
+
+- this is a narrow follow-up to the send-side OOB work: it removes a few remaining asynchronous `info.OOB()` rebuilds without pushing caching into the receive hot path
+- storing cached OOB on queue items is lower risk than adding an OOB cache directly to `packetInfo`, which would increase `receivedPacket` size for every incoming packet
+
+Expected effect:
+
+- fewer repeated `packetInfo.OOB()` allocations on delayed control-packet send paths
+- cleaner separation between "capture packet metadata at enqueue time" and "serialize packet to socket later"
+
+Verification:
+
+- `git diff --check` passed on 2026-04-19 after this round
+- `go test` could not be run on 2026-04-19 because `go` was not installed in `PATH` in this environment
+
+Follow-up still worth doing:
+
+- when a Go toolchain is available, run focused tests for the new OOB-caching helpers and surrounding server / transport paths
+- if benchmarks show these control-packet paths still matter, consider whether other queued packet types should capture send metadata the same way
+
+### 2026-04-19 - Round 4: HTTP/3 datagram receive queue ring buffer
+
+Status:
+
+- implemented
+- verification partially blocked by missing Go toolchain in this environment
+
+Files touched:
+
+- `http3/datagram.go`
+- `http3/datagram_test.go`
+
+What changed:
+
+- replaced the HTTP/3 datagram receive queue's `[][]byte` slice with a preinitialized ring buffer
+- kept the queue bounded at `streamDatagramQueueLen`, so the externally visible drop behavior stays the same
+- removed the repeated `queue = queue[1:]` head-slice churn on every receive
+- added a focused wrap-around ordering test to pin the new queue behavior
+
+Why this shape:
+
+- this follows the existing local TODO in `http3/datagram.go`
+- the change is tightly scoped to the HTTP/3 datagram receive helper and does not affect QUIC DATAGRAM ownership semantics
+- compared with optimizing `http3/conn.go` datagram send copies, this is a lower-risk step because it doesn't change buffer lifetime expectations
+
+Expected effect:
+
+- lower queue bookkeeping overhead for HTTP/3 datagram receive paths
+- less chance of retaining older backing arrays through repeated head-slicing
+- stable FIFO behavior under enqueue / dequeue wrap-around
+
+Verification:
+
+- `git diff --check` passed on 2026-04-19 after this round
+- `go test` could not be run on 2026-04-19 because `go` was not installed in `PATH` in this environment
+
+Follow-up still worth doing:
+
+- when a Go toolchain is available, run focused HTTP/3 datagram tests
+- revisit `http3/conn.go` send-side datagram copy reduction if profiling shows HTTP/3 datagrams are still allocation-heavy
+
+### 2026-04-19 - Round 5: QUIC datagram queue ring buffers
+
+Status:
+
+- implemented
+- verification partially blocked by missing Go toolchain in this environment
+
+Files touched:
+
+- `datagram_queue.go`
+- `datagram_queue_test.go`
+
+What changed:
+
+- replaced the QUIC datagram receive queue's `[][]byte` container with a ring buffer while keeping the existing payload copy semantics unchanged
+- preinitialized both the send and receive ring buffers in `newDatagramQueue` to their bounded capacities, avoiding incremental growth on the first pushes
+- kept the queue limits and blocking / drop behavior unchanged
+- added a wrap-around FIFO test for the receive queue
+
+Why this shape:
+
+- this is a structural queue optimization only; it deliberately does not try to pool or reuse received datagram payload buffers
+- that keeps buffer ownership semantics unchanged while still removing repeated head-slice churn
+
+Expected effect:
+
+- lower queue bookkeeping overhead on QUIC DATAGRAM receive paths
+- fewer small allocations while filling the bounded send queue
+- less chance of retaining older receive-queue backing arrays through repeated `queue = queue[1:]` slicing
+
+Verification:
+
+- `git diff --check` passed on 2026-04-19 after this round
+- `go test` could not be run on 2026-04-19 because `go` was not installed in `PATH` in this environment
+
+Follow-up still worth doing:
+
+- when a Go toolchain is available, run focused DATAGRAM queue tests
+- if profiling still highlights DATAGRAM traffic, revisit payload buffer reuse separately with explicit ownership rules
+
+### 2026-04-19 - Round 6: shared batch receive timestamp in sys_conn_oob
+
+Status:
+
+- implemented
+- verification partially blocked by missing Go toolchain in this environment
+
+Files touched:
+
+- `sys_conn_oob.go`
+- `sys_conn_oob_test.go`
+
+What changed:
+
+- captured a single `time.Now()` timestamp after each successful `ReadBatch` call and reused it for all packets returned from that batch
+- added a focused test that verifies packets pulled from the same mocked batch share the same receive timestamp even when `ReadPacket` calls are separated in time
+
+Why this shape:
+
+- this is a direct reduction of per-packet work on the batched UDP receive path
+- the semantic tradeoff is explicit and small: timestamps are now batch-granularity instead of per-`ReadPacket` call, which is a better fit for batched reads anyway
+
+Expected effect:
+
+- fewer `time.Now()` calls on the highest-throughput receive path
+- receive timestamps that better reflect "batch arrival time" than "when the caller happened to pull the next message out of the batch"
+
+Verification:
+
+- `git diff --check` passed on 2026-04-19 after this round
+- `go test` could not be run on 2026-04-19 because `go` was not installed in `PATH` in this environment
+
+Follow-up still worth doing:
+
+- when a Go toolchain is available, run focused `sys_conn_oob` tests
+- if profiling still points to receive-side metadata work, revisit whether any OOB parsing can be tightened further without sacrificing clarity
+
+### 2026-04-19 - Round 7: HTTP/3 datagram send fast path
+
+Status:
+
+- implemented
+- verification partially blocked by missing Go toolchain in this environment
+
+Files touched:
+
+- `connection.go`
+- `http3/conn.go`
+- `http3/conn_test.go`
+
+What changed:
+
+- factored QUIC datagram sending in `connection.go` through a shared helper that can prepend an internal header slice and still perform only one payload copy into the queued DATAGRAM frame
+- added an optional `SendDatagramWithHeader` fast path on quic-go's internal connection implementation
+- updated HTTP/3 datagram sending to use that fast path when the underlying QUIC connection supports it, and fall back to the public `SendDatagram([]byte)` path otherwise
+- added a focused HTTP/3 test for the fast-path behavior while preserving the existing fallback-path test
+
+Why this shape:
+
+- this avoids changing the public QUIC connection interface
+- non-quic-go implementations keep working through the fallback path
+- the optimization targets the specific extra allocation / copy already called out by the HTTP/3 TODO, without changing datagram ownership semantics
+
+Expected effect:
+
+- one fewer temporary allocation / copy on HTTP/3 datagram sends when using quic-go's own connection implementation
+- preserved compatibility for callers using other QUIC implementations behind the same interface
+
+Verification:
+
+- `git diff --check` passed on 2026-04-19 after this round
+- `go test` could not be run on 2026-04-19 because `go` was not installed in `PATH` in this environment
+
+Follow-up still worth doing:
+
+- when a Go toolchain is available, run focused HTTP/3 connection / datagram tests
+- if datagram send profiling still points here, consider whether a similar segmented-copy helper is worthwhile elsewhere, but avoid broadening it without measurements

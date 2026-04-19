@@ -38,6 +38,22 @@ type closePacket struct {
 	payload []byte
 	addr    net.Addr
 	info    packetInfo
+
+	packetInfoOOB []byte
+}
+
+type packetHandlerMapCleanupKind uint8
+
+const (
+	packetHandlerMapCleanupRetired packetHandlerMapCleanupKind = iota
+	packetHandlerMapCleanupClosed
+)
+
+type packetHandlerMapCleanupEntry struct {
+	deadline time.Time
+	kind     packetHandlerMapCleanupKind
+	id       protocol.ConnectionID
+	ids      []protocol.ConnectionID
 }
 
 type packetHandlerMap struct {
@@ -45,8 +61,10 @@ type packetHandlerMap struct {
 	handlers    map[protocol.ConnectionID]packetHandler
 	resetTokens map[protocol.StatelessResetToken] /* stateless reset token */ packetHandler
 
-	closed    bool
-	closeChan chan struct{}
+	closed           bool
+	closeChan        chan struct{}
+	cleanupScheduled chan struct{}
+	pendingCleanups  []packetHandlerMapCleanupEntry
 
 	enqueueClosePacket func(closePacket)
 
@@ -60,12 +78,14 @@ var _ packetHandlerManager = &packetHandlerMap{}
 func newPacketHandlerMap(enqueueClosePacket func(closePacket), logger utils.Logger) *packetHandlerMap {
 	h := &packetHandlerMap{
 		closeChan:               make(chan struct{}),
+		cleanupScheduled:        make(chan struct{}, 1),
 		handlers:                make(map[protocol.ConnectionID]packetHandler),
 		resetTokens:             make(map[protocol.StatelessResetToken]packetHandler),
 		deleteRetiredConnsAfter: protocol.RetiredConnectionIDDeleteTimeout,
 		enqueueClosePacket:      enqueueClosePacket,
 		logger:                  logger,
 	}
+	go h.runCleanupQueue()
 	if h.logger.Debug() {
 		go h.logUsage()
 	}
@@ -74,6 +94,7 @@ func newPacketHandlerMap(enqueueClosePacket func(closePacket), logger utils.Logg
 
 func (h *packetHandlerMap) logUsage() {
 	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
 	var printedZero bool
 	for {
 		select {
@@ -142,11 +163,10 @@ func (h *packetHandlerMap) Remove(id protocol.ConnectionID) {
 
 func (h *packetHandlerMap) Retire(id protocol.ConnectionID) {
 	h.logger.Debugf("Retiring connection ID %s in %s.", id, h.deleteRetiredConnsAfter)
-	time.AfterFunc(h.deleteRetiredConnsAfter, func() {
-		h.mutex.Lock()
-		delete(h.handlers, id)
-		h.mutex.Unlock()
-		h.logger.Debugf("Removing connection ID %s after it has been retired.", id)
+	h.scheduleCleanup(packetHandlerMapCleanupEntry{
+		deadline: time.Now().Add(h.deleteRetiredConnsAfter),
+		kind:     packetHandlerMapCleanupRetired,
+		id:       id,
 	})
 }
 
@@ -159,7 +179,12 @@ func (h *packetHandlerMap) ReplaceWithClosed(ids []protocol.ConnectionID, connCl
 	if connClosePacket != nil {
 		handler = newClosedLocalConn(
 			func(addr net.Addr, info packetInfo) {
-				h.enqueueClosePacket(closePacket{payload: connClosePacket, addr: addr, info: info})
+				h.enqueueClosePacket(closePacket{
+					payload:       connClosePacket,
+					addr:          addr,
+					info:          info,
+					packetInfoOOB: info.OOB(),
+				})
 			},
 			h.logger,
 		)
@@ -174,13 +199,10 @@ func (h *packetHandlerMap) ReplaceWithClosed(ids []protocol.ConnectionID, connCl
 	h.mutex.Unlock()
 	h.logger.Debugf("Replacing connection for connection IDs %s with a closed connection.", ids)
 
-	time.AfterFunc(h.deleteRetiredConnsAfter, func() {
-		h.mutex.Lock()
-		for _, id := range ids {
-			delete(h.handlers, id)
-		}
-		h.mutex.Unlock()
-		h.logger.Debugf("Removing connection IDs %s for a closed connection after it has been retired.", ids)
+	h.scheduleCleanup(packetHandlerMapCleanupEntry{
+		deadline: time.Now().Add(h.deleteRetiredConnsAfter),
+		kind:     packetHandlerMapCleanupClosed,
+		ids:      append([]protocol.ConnectionID(nil), ids...),
 	})
 }
 
@@ -212,6 +234,7 @@ func (h *packetHandlerMap) Close(e error) {
 		return
 	}
 
+	h.closed = true
 	close(h.closeChan)
 
 	var wg sync.WaitGroup
@@ -222,7 +245,105 @@ func (h *packetHandlerMap) Close(e error) {
 			wg.Done()
 		}(handler)
 	}
-	h.closed = true
 	h.mutex.Unlock()
 	wg.Wait()
+}
+
+func (h *packetHandlerMap) scheduleCleanup(entry packetHandlerMapCleanupEntry) {
+	h.mutex.Lock()
+	if h.closed {
+		h.mutex.Unlock()
+		return
+	}
+	h.pendingCleanups = append(h.pendingCleanups, entry)
+	h.mutex.Unlock()
+
+	select {
+	case h.cleanupScheduled <- struct{}{}:
+	default:
+	}
+}
+
+func (h *packetHandlerMap) runCleanupQueue() {
+	timer := utils.NewTimer()
+	defer timer.Stop()
+
+	for {
+		timer.Reset(h.nextCleanupDeadline())
+
+		select {
+		case <-h.closeChan:
+			return
+		case <-h.cleanupScheduled:
+			continue
+		case <-timer.Chan():
+			timer.SetRead()
+			h.runDueCleanups(time.Now())
+		}
+	}
+}
+
+func (h *packetHandlerMap) nextCleanupDeadline() time.Time {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+
+	if len(h.pendingCleanups) == 0 {
+		return time.Time{}
+	}
+
+	deadline := h.pendingCleanups[0].deadline
+	for _, entry := range h.pendingCleanups[1:] {
+		if entry.deadline.Before(deadline) {
+			deadline = entry.deadline
+		}
+	}
+	return deadline
+}
+
+func (h *packetHandlerMap) runDueCleanups(now time.Time) {
+	h.mutex.Lock()
+	if len(h.pendingCleanups) == 0 {
+		h.mutex.Unlock()
+		return
+	}
+
+	pending := h.pendingCleanups
+	remaining := pending[:0]
+	var due []packetHandlerMapCleanupEntry
+	for _, entry := range pending {
+		if !entry.deadline.After(now) {
+			due = append(due, entry)
+			continue
+		}
+		remaining = append(remaining, entry)
+	}
+	for i := len(remaining); i < len(pending); i++ {
+		pending[i] = packetHandlerMapCleanupEntry{}
+	}
+	h.pendingCleanups = remaining
+	h.mutex.Unlock()
+
+	for _, entry := range due {
+		h.runCleanup(entry)
+	}
+}
+
+func (h *packetHandlerMap) runCleanup(entry packetHandlerMapCleanupEntry) {
+	h.mutex.Lock()
+	switch entry.kind {
+	case packetHandlerMapCleanupRetired:
+		delete(h.handlers, entry.id)
+	case packetHandlerMapCleanupClosed:
+		for _, id := range entry.ids {
+			delete(h.handlers, id)
+		}
+	}
+	h.mutex.Unlock()
+
+	switch entry.kind {
+	case packetHandlerMapCleanupRetired:
+		h.logger.Debugf("Removing connection ID %s after it has been retired.", entry.id)
+	case packetHandlerMapCleanupClosed:
+		h.logger.Debugf("Removing connection IDs %s for a closed connection after it has been retired.", entry.ids)
+	}
 }

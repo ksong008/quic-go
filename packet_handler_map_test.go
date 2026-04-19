@@ -13,8 +13,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func newPacketHandlerMapForTest(t *testing.T, enqueueClosePacket func(closePacket)) *packetHandlerMap {
+	t.Helper()
+	m := newPacketHandlerMap(enqueueClosePacket, utils.DefaultLogger)
+	t.Cleanup(func() { m.Close(nil) })
+	return m
+}
+
 func TestPacketHandlerMapAddAndRemove(t *testing.T) {
-	m := newPacketHandlerMap(nil, utils.DefaultLogger)
+	m := newPacketHandlerMapForTest(t, nil)
 	connID := protocol.ParseConnectionID([]byte{1, 2, 3, 4})
 	h := &mockPacketHandler{}
 	require.True(t, m.Add(connID, h))
@@ -36,7 +43,7 @@ func TestPacketHandlerMapAddAndRemove(t *testing.T) {
 }
 
 func TestPacketHandlerMapAddWithClientChosenConnID(t *testing.T) {
-	m := newPacketHandlerMap(nil, utils.DefaultLogger)
+	m := newPacketHandlerMapForTest(t, nil)
 	h := &mockPacketHandler{}
 
 	connID1 := protocol.ParseConnectionID([]byte{1, 2, 3, 4})
@@ -54,7 +61,7 @@ func TestPacketHandlerMapAddWithClientChosenConnID(t *testing.T) {
 }
 
 func TestPacketHandlerMapRetire(t *testing.T) {
-	m := newPacketHandlerMap(nil, utils.DefaultLogger)
+	m := newPacketHandlerMapForTest(t, nil)
 	dur := scaleDuration(10 * time.Millisecond)
 	m.deleteRetiredConnsAfter = dur
 	connID := protocol.ParseConnectionID([]byte{1, 2, 3, 4})
@@ -75,8 +82,37 @@ func TestPacketHandlerMapRetire(t *testing.T) {
 	}, dur, dur/10)
 }
 
+func TestPacketHandlerMapRetireMultipleConnectionIDs(t *testing.T) {
+	m := newPacketHandlerMapForTest(t, nil)
+	dur := scaleDuration(20 * time.Millisecond)
+	m.deleteRetiredConnsAfter = dur
+
+	connIDs := []protocol.ConnectionID{
+		protocol.ParseConnectionID([]byte{1, 2, 3, 4}),
+		protocol.ParseConnectionID([]byte{4, 3, 2, 1}),
+	}
+	for _, connID := range connIDs {
+		require.True(t, m.Add(connID, &mockPacketHandler{}))
+		m.Retire(connID)
+	}
+
+	for _, connID := range connIDs {
+		_, ok := m.Get(connID)
+		require.True(t, ok)
+	}
+
+	require.Eventually(t, func() bool {
+		for _, connID := range connIDs {
+			if _, ok := m.Get(connID); ok {
+				return false
+			}
+		}
+		return true
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestPacketHandlerMapAddGetRemoveResetTokens(t *testing.T) {
-	m := newPacketHandlerMap(nil, utils.DefaultLogger)
+	m := newPacketHandlerMapForTest(t, nil)
 	token := protocol.StatelessResetToken{1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf}
 	handler := &mockPacketHandler{}
 	m.AddResetToken(token, handler)
@@ -90,9 +126,8 @@ func TestPacketHandlerMapAddGetRemoveResetTokens(t *testing.T) {
 
 func TestPacketHandlerMapReplaceWithLocalClosed(t *testing.T) {
 	var closePackets []closePacket
-	m := newPacketHandlerMap(
+	m := newPacketHandlerMapForTest(t,
 		func(p closePacket) { closePackets = append(closePackets, p) },
-		utils.DefaultLogger,
 	)
 	dur := scaleDuration(10 * time.Millisecond)
 	m.deleteRetiredConnsAfter = dur
@@ -117,11 +152,42 @@ func TestPacketHandlerMapReplaceWithLocalClosed(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
+func TestPacketHandlerMapReplaceWithClosedRemovesAllConnectionIDs(t *testing.T) {
+	m := newPacketHandlerMapForTest(t, nil)
+	dur := scaleDuration(20 * time.Millisecond)
+	m.deleteRetiredConnsAfter = dur
+
+	handler := &mockPacketHandler{}
+	connIDs := []protocol.ConnectionID{
+		protocol.ParseConnectionID([]byte{4, 3, 2, 1}),
+		protocol.ParseConnectionID([]byte{1, 3, 2, 4}),
+	}
+	for _, connID := range connIDs {
+		require.True(t, m.Add(connID, handler))
+	}
+
+	m.ReplaceWithClosed(connIDs, nil)
+
+	for _, connID := range connIDs {
+		h, ok := m.Get(connID)
+		require.True(t, ok)
+		require.NotEqual(t, handler, h)
+	}
+
+	require.Eventually(t, func() bool {
+		for _, connID := range connIDs {
+			if _, ok := m.Get(connID); ok {
+				return false
+			}
+		}
+		return true
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestPacketHandlerMapReplaceWithRemoteClosed(t *testing.T) {
 	var closePackets []closePacket
-	m := newPacketHandlerMap(
+	m := newPacketHandlerMapForTest(t,
 		func(p closePacket) { closePackets = append(closePackets, p) },
-		utils.DefaultLogger,
 	)
 	dur := scaleDuration(50 * time.Millisecond)
 	m.deleteRetiredConnsAfter = dur

@@ -446,5 +446,40 @@ var _ = Describe("Connection", func() {
 
 			Expect(conn.sendDatagram(strID, []byte("foobar"))).To(MatchError(testErr))
 		})
+
+		It("uses the header fast path when available", func() {
+			const strID = 404
+			testErr := errors.New("test error")
+			qconn := &headerDatagramConn{
+				MockQUICConn: mockquic.NewMockQUICConn(mockCtrl),
+				err:          testErr,
+			}
+			conn := newConnection(
+				context.Background(),
+				qconn,
+				true,
+				protocol.PerspectiveClient,
+				nil,
+				0,
+			)
+
+			Expect(conn.sendDatagram(strID, []byte("foobar"))).To(MatchError(testErr))
+			Expect(qconn.header).To(Equal(quicvarint.Append([]byte{}, strID/4)))
+			Expect(qconn.payload).To(Equal([]byte("foobar")))
+		})
 	})
 })
+
+type headerDatagramConn struct {
+	*mockquic.MockQUICConn
+
+	header  []byte
+	payload []byte
+	err     error
+}
+
+func (c *headerDatagramConn) SendDatagramWithHeader(header, payload []byte) error {
+	c.header = append([]byte{}, header...)
+	c.payload = append([]byte{}, payload...)
+	return c.err
+}

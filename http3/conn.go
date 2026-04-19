@@ -60,6 +60,10 @@ type connection struct {
 	idleTimer   *time.Timer
 }
 
+type datagramHeaderSender interface {
+	SendDatagramWithHeader([]byte, []byte) error
+}
+
 func newConnection(
 	ctx context.Context,
 	quicConn quic.Connection,
@@ -283,9 +287,14 @@ func (c *connection) handleUnidirectionalStreams(hijack func(StreamType, quic.Co
 }
 
 func (c *connection) sendDatagram(streamID protocol.StreamID, b []byte) error {
-	// TODO: this creates a lot of garbage and an additional copy
-	data := make([]byte, 0, len(b)+8)
-	data = quicvarint.Append(data, uint64(streamID/4))
+	var header [8]byte
+	prefix := quicvarint.Append(header[:0], uint64(streamID/4))
+	if sender, ok := c.Connection.(datagramHeaderSender); ok {
+		return sender.SendDatagramWithHeader(prefix, b)
+	}
+
+	// Fallback for non-quic-go connections that only implement the public QUIC interface.
+	data := append([]byte{}, prefix...)
 	data = append(data, b...)
 	return c.Connection.SendDatagram(data)
 }

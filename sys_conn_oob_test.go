@@ -310,6 +310,23 @@ func TestReadsMultipleMessagesInOneBatch(t *testing.T) {
 	require.Equal(t, 2, bc.callCounter)
 }
 
+func TestReadBatchUsesSharedReceiveTimestamp(t *testing.T) {
+	bc := &mockBatchConn{t: t, numMsgRead: 2}
+
+	udpConn := newUPDConnLocalhost(t)
+	oobConn, err := newConn(udpConn, true)
+	require.NoError(t, err)
+	oobConn.batchConn = bc
+
+	first, err := oobConn.ReadPacket()
+	require.NoError(t, err)
+	time.Sleep(scaleDuration(5 * time.Millisecond))
+	second, err := oobConn.ReadPacket()
+	require.NoError(t, err)
+
+	require.Equal(t, first.rcvTime, second.rcvTime)
+}
+
 func TestSysConnSendGSO(t *testing.T) {
 	if !platformSupportsGSO {
 		t.Skip("GSO not supported on this platform")
