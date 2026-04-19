@@ -83,7 +83,7 @@ func isGSOEnabled(conn syscall.RawConn) bool {
 func appendUDPSegmentSizeMsg(b []byte, size uint16) []byte {
 	startLen := len(b)
 	const dataLen = 2 // payload is a uint16
-	b = append(b, make([]byte, unix.CmsgSpace(dataLen))...)
+	b = appendControlMessageSpace(b, dataLen)
 	h := (*unix.Cmsghdr)(unsafe.Pointer(&b[startLen]))
 	h.Level = syscall.IPPROTO_UDP
 	h.Type = unix.UDP_SEGMENT

@@ -8,6 +8,12 @@ import (
 	"github.com/daeuniverse/quic-go/internal/utils"
 )
 
+const (
+	sendConnOOBCacheSize     = int(protocol.ECNCE) + 1
+	sendConnOOBBufferSize    = 128
+	sendConnOOBExtraCapacity = 64
+)
+
 // A sendConn allows sending using a simple Write() on a non-connected packet conn.
 type sendConn interface {
 	Write(b []byte, gsoSize uint16, ecn protocol.ECN) error
@@ -28,6 +34,9 @@ type sconn struct {
 	logger utils.Logger
 
 	packetInfoOOB []byte
+	// Immutable cached OOB payloads for the common no-GSO ECN send path.
+	packetInfoOOBIPv4ECN [sendConnOOBCacheSize][]byte
+	packetInfoOOBIPv6ECN [sendConnOOBCacheSize][]byte
 	// If GSO enabled, and we receive a GSO error for this remote address, GSO is disabled.
 	gotGSOError bool
 	// Used to catch the error sometimes returned by the first sendmsg call on Linux,
@@ -50,7 +59,7 @@ func newSendConn(c rawConn, remote net.Addr, info packetInfo, logger utils.Logge
 	oob := info.OOB()
 	// increase oob slice capacity, so we can add the UDP_SEGMENT and ECN control messages without allocating
 	l := len(oob)
-	oob = append(oob, make([]byte, 64)...)[:l]
+	oob = append(oob, make([]byte, sendConnOOBExtraCapacity)...)[:l]
 	sc := &sconn{
 		rawConn:       c,
 		localAddr:     localAddr,
@@ -58,14 +67,15 @@ func newSendConn(c rawConn, remote net.Addr, info packetInfo, logger utils.Logge
 		packetInfoOOB: oob,
 		logger:        logger,
 	}
+	sc.initOOBCache()
 	sc.SetRemoteAddr(remote)
 	return sc
 }
 
 func (c *sconn) Write(p []byte, gsoSize uint16, ecn protocol.ECN) error {
 	remoteAddr := c.remoteAddr.Load().(net.Addr)
-	_, err := c.WritePacket(p, remoteAddr, c.packetInfoOOB, gsoSize, ecn)
-	if err != nil && isGSOError(err) {
+	err := c.writePacket(p, remoteAddr, gsoSize, ecn)
+	if err != nil && gsoSize > 0 && isGSOError(err) {
 		// disable GSO for future calls
 		c.gotGSOError = true
 		if c.logger.Debug() {
@@ -77,7 +87,7 @@ func (c *sconn) Write(p []byte, gsoSize uint16, ecn protocol.ECN) error {
 			if l > int(gsoSize) {
 				l = int(gsoSize)
 			}
-			if _, err := c.WritePacket(p[:l], remoteAddr, c.packetInfoOOB, 0, ecn); err != nil {
+			if err := c.writePacket(p[:l], remoteAddr, 0, ecn); err != nil {
 				return err
 			}
 			p = p[l:]
@@ -87,10 +97,13 @@ func (c *sconn) Write(p []byte, gsoSize uint16, ecn protocol.ECN) error {
 	return err
 }
 
-func (c *sconn) writePacket(p []byte, addr net.Addr, oob []byte, gsoSize uint16, ecn protocol.ECN) error {
-	_, err := c.WritePacket(p, addr, oob, gsoSize, ecn)
+func (c *sconn) writePacket(p []byte, addr net.Addr, gsoSize uint16, ecn protocol.ECN) error {
+	var oobBuffer [sendConnOOBBufferSize]byte
+	oob, preparedGSOSize, preparedECN := c.prepareOOB(addr, gsoSize, ecn, oobBuffer[:0])
+	_, err := c.WritePacket(p, addr, oob, preparedGSOSize, preparedECN)
 	if err != nil && !c.wroteFirstPacket && isPermissionError(err) {
-		_, err = c.WritePacket(p, addr, oob, gsoSize, ecn)
+		oob, preparedGSOSize, preparedECN = c.prepareOOB(addr, gsoSize, ecn, oobBuffer[:0])
+		_, err = c.WritePacket(p, addr, oob, preparedGSOSize, preparedECN)
 	}
 	c.wroteFirstPacket = true
 	return err

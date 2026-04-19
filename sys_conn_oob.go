@@ -301,9 +301,20 @@ func (info *packetInfo) OOB() []byte {
 	return nil
 }
 
+func appendControlMessageSpace(b []byte, dataLen int) []byte {
+	startLen := len(b)
+	endLen := startLen + unix.CmsgSpace(dataLen)
+	if endLen <= cap(b) {
+		b = b[:endLen]
+		clear(b[startLen:endLen])
+		return b
+	}
+	return append(b, make([]byte, endLen-startLen)...)
+}
+
 func appendIPv4ECNMsg(b []byte, val protocol.ECN) []byte {
 	startLen := len(b)
-	b = append(b, make([]byte, unix.CmsgSpace(ecnIPv4DataLen))...)
+	b = appendControlMessageSpace(b, ecnIPv4DataLen)
 	h := (*unix.Cmsghdr)(unsafe.Pointer(&b[startLen]))
 	h.Level = syscall.IPPROTO_IP
 	h.Type = unix.IP_TOS
@@ -318,7 +329,7 @@ func appendIPv4ECNMsg(b []byte, val protocol.ECN) []byte {
 func appendIPv6ECNMsg(b []byte, val protocol.ECN) []byte {
 	startLen := len(b)
 	const dataLen = 4
-	b = append(b, make([]byte, unix.CmsgSpace(dataLen))...)
+	b = appendControlMessageSpace(b, dataLen)
 	h := (*unix.Cmsghdr)(unsafe.Pointer(&b[startLen]))
 	h.Level = syscall.IPPROTO_IPV6
 	h.Type = unix.IPV6_TCLASS

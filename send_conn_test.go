@@ -40,12 +40,12 @@ func TestSendConnOOB(t *testing.T) {
 		t.Skip("we don't OOB conn on windows, and no packet info will be available")
 	}
 
-	remoteAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 100, 200), Port: 1337}
+	remoteAddr := &net.UDPAddr{IP: net.IPv6loopback, Port: 1337}
 	rawConn := NewMockRawConn(gomock.NewController(t))
 	rawConn.EXPECT().LocalAddr()
-	rawConn.EXPECT().capabilities().AnyTimes()
 	pi := packetInfo{addr: netip.IPv6Loopback()}
-	rawConn.EXPECT().WritePacket([]byte("foobar"), remoteAddr, pi.OOB(), uint16(0), protocol.ECT1)
+	expectedOOB := appendIPv6ECNMsg(append([]byte{}, pi.OOB()...), protocol.ECT1)
+	rawConn.EXPECT().WritePacket([]byte("foobar"), remoteAddr, expectedOOB, uint16(0), protocol.ECNUnsupported)
 	require.NotEmpty(t, pi.OOB())
 	c := newSendConn(rawConn, remoteAddr, pi, utils.DefaultLogger)
 	require.NoError(t, c.Write([]byte("foobar"), 0, protocol.ECT1))
@@ -61,10 +61,13 @@ func TestSendConnDetectGSOFailure(t *testing.T) {
 	rawConn.EXPECT().LocalAddr()
 	rawConn.EXPECT().capabilities().Return(connCapabilities{GSO: true}).MinTimes(1)
 	c := newSendConn(rawConn, remoteAddr, packetInfo{}, utils.DefaultLogger)
+	expectedGSOOOB := appendUDPSegmentSizeMsg([]byte{}, 4)
+	expectedGSOOOB = appendIPv4ECNMsg(expectedGSOOOB, protocol.ECNCE)
+	expectedECNOOB := appendIPv4ECNMsg([]byte{}, protocol.ECNCE)
 	gomock.InOrder(
-		rawConn.EXPECT().WritePacket([]byte("foobar"), remoteAddr, gomock.Any(), uint16(4), protocol.ECNCE).Return(0, errGSO),
-		rawConn.EXPECT().WritePacket([]byte("foob"), remoteAddr, gomock.Any(), uint16(0), protocol.ECNCE).Return(4, nil),
-		rawConn.EXPECT().WritePacket([]byte("ar"), remoteAddr, gomock.Any(), uint16(0), protocol.ECNCE).Return(2, nil),
+		rawConn.EXPECT().WritePacket([]byte("foobar"), remoteAddr, expectedGSOOOB, uint16(0), protocol.ECNUnsupported).Return(0, errGSO),
+		rawConn.EXPECT().WritePacket([]byte("foob"), remoteAddr, expectedECNOOB, uint16(0), protocol.ECNUnsupported).Return(4, nil),
+		rawConn.EXPECT().WritePacket([]byte("ar"), remoteAddr, expectedECNOOB, uint16(0), protocol.ECNUnsupported).Return(2, nil),
 	)
 	require.NoError(t, c.Write([]byte("foobar"), 4, protocol.ECNCE))
 	require.False(t, c.capabilities().GSO)
@@ -80,11 +83,11 @@ func TestSendConnSendmsgFailures(t *testing.T) {
 	t.Run("first call to sendmsg fails", func(t *testing.T) {
 		rawConn := NewMockRawConn(gomock.NewController(t))
 		rawConn.EXPECT().LocalAddr()
-		rawConn.EXPECT().capabilities().AnyTimes()
 		c := newSendConn(rawConn, remoteAddr, packetInfo{}, utils.DefaultLogger)
+		expectedOOB := appendIPv4ECNMsg([]byte{}, protocol.ECNCE)
 		gomock.InOrder(
-			rawConn.EXPECT().WritePacket([]byte("foobar"), remoteAddr, gomock.Any(), gomock.Any(), protocol.ECNCE).Return(0, errNotPermitted),
-			rawConn.EXPECT().WritePacket([]byte("foobar"), remoteAddr, gomock.Any(), uint16(0), protocol.ECNCE).Return(6, nil),
+			rawConn.EXPECT().WritePacket([]byte("foobar"), remoteAddr, expectedOOB, uint16(0), protocol.ECNUnsupported).Return(0, errNotPermitted),
+			rawConn.EXPECT().WritePacket([]byte("foobar"), remoteAddr, expectedOOB, uint16(0), protocol.ECNUnsupported).Return(6, nil),
 		)
 		require.NoError(t, c.Write([]byte("foobar"), 0, protocol.ECNCE))
 	})
@@ -92,9 +95,9 @@ func TestSendConnSendmsgFailures(t *testing.T) {
 	t.Run("later call to sendmsg fails", func(t *testing.T) {
 		rawConn := NewMockRawConn(gomock.NewController(t))
 		rawConn.EXPECT().LocalAddr()
-		rawConn.EXPECT().capabilities().AnyTimes()
 		c := newSendConn(rawConn, remoteAddr, packetInfo{}, utils.DefaultLogger)
-		rawConn.EXPECT().WritePacket([]byte("foobar"), remoteAddr, gomock.Any(), gomock.Any(), protocol.ECNCE).Return(0, errNotPermitted).Times(2)
+		expectedOOB := appendIPv4ECNMsg([]byte{}, protocol.ECNCE)
+		rawConn.EXPECT().WritePacket([]byte("foobar"), remoteAddr, expectedOOB, uint16(0), protocol.ECNUnsupported).Return(0, errNotPermitted).Times(2)
 		require.Error(t, c.Write([]byte("foobar"), 0, protocol.ECNCE))
 	})
 }
